@@ -13,8 +13,9 @@
 # VLLM_NCCL_SO_PATH and LD_PRELOAD. It self-identifies as "NCCL version 2.30.7
 # compiled with CUDA 13.0", targets arm64, and has sha256
 # ccd57342449c3f680befcb379329b935746e5299dc4de5f2516146e0411bd85f. The build's
-# source revision is unrecorded; verify licensing before any public
-# redistribution of this repository.
+# source revision is unrecorded; its dynamic symbols and embedded strings match
+# a stock NCCL build. License terms: THIRD_PARTY_NOTICES.md at the repository
+# root.
 FROM vllm/vllm-openai:glm53-flash@sha256:2c6da6c6f16ed15c91e412d896dba13701f25fe1861eaec9ddaa4db34d1d21c4
 
 ARG VLLM_DIR=/usr/local/lib/python3.12/dist-packages/vllm

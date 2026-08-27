@@ -31,7 +31,7 @@ image="glm53-nvfp4-serving:local"
 container="glm53-nvfp4-tp2-mtp3-r${rank}"
 model_dir="/var/tmp/models/local-inference-lab--GLM-5.3-Flash-NVFP4/staging"
 cache_dir="/var/tmp/glm53-nvfp4-tp2-jit-r${rank}"
-master_addr="192.168.0.200"
+master_addr="192.0.2.10"  # rank-0 node address; set to yours
 master_port=29699
 
 headless=()

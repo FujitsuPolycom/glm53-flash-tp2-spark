@@ -25,9 +25,9 @@ that `--kda-prefill-backend flashkda` selects.
 through `VLLM_NCCL_SO_PATH` and `LD_PRELOAD`. It self-identifies as
 `NCCL version 2.30.7 compiled with CUDA 13.0`, targets arm64, and has sha256
 `ccd57342449c3f680befcb379329b935746e5299dc4de5f2516146e0411bd85f`. Its source
-revision is unrecorded — verify licensing before redistributing this
-repository publicly. Whether the stock NCCL shipped in the base image also
-works is **untested**.
+revision is unrecorded; its dynamic symbols and embedded strings match a stock
+NCCL build. License terms are in `THIRD_PARTY_NOTICES.md`. Whether the stock
+NCCL shipped in the base image also works is **untested**.
 
 The image and the checkpoint must be present at identical tags and paths on
 both nodes.
@@ -102,7 +102,7 @@ matches the config's keys whether or not the target's mapper has rewritten
 them, which makes the lookup independent of the order in which the target and
 draft models are built.
 
-Confirm it took, in the engine log:
+Confirm the remap is active, in the engine log:
 
 ```
 [quantprobe] layer=RoutedExperts prefix=model.layers.45.mlp.experts algo=MXFP8
@@ -136,6 +136,7 @@ switched fabric. Flags that are load-bearing rather than tuning choices:
 | `--speculative-config` | `{"method":"mtp","num_speculative_tokens":3}` | Requires the MTP fix above. |
 | `--max-model-len` | `524288` | 10 GiB of KV yields ~1.16M tokens, 2.22 concurrent requests at this length. |
 | `--max-num-seqs` | `8` | Requests beyond this queue; aggregate throughput is flat above it. |
+
 The launch script does not pass `--load-format`, so weight loading uses the
 sequential default (~700 s for the 184 GB of shards). The `instanttensor`
 loader reads the same shards in ~30 s with parallel direct I/O. To use it,
@@ -178,3 +179,8 @@ curl -s http://<rank0-address>:8000/v1/chat/completions \
        "temperature":1,"max_tokens":1024,
        "chat_template_kwargs":{"reasoning_effort":"low"}}'
 ```
+
+## License
+
+Apache License 2.0 (`LICENSE`). Third-party components — the NCCL binary and
+the vLLM-derived patch content — are covered in `THIRD_PARTY_NOTICES.md`.
