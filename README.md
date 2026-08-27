@@ -11,7 +11,6 @@ both nodes. The launch script names the tag in one assignment at its top.
 
 ```bash
 cd image
-mkdir -p nccl && cp /path/to/your/nccl/libnccl.so* nccl/
 docker build -t glm53-nvfp4-serving:local .
 ```
 
@@ -22,12 +21,13 @@ build applies two source patches, in `image/patches/`, totalling 184 changed
 lines: one to the multimodal renderer, one to the linear-attention prefill path
 that `--kda-prefill-backend flashkda` selects.
 
-`nccl/` must hold an NCCL 2.30.7 build for this hardware; the launch script
-selects it through `VLLM_NCCL_SO_PATH` and `LD_PRELOAD`. No NCCL binary is
-included here. The build qualified on this hardware has
-`libnccl.so.2.30.7` with sha256
-`ccd57342449c3f680befcb379329b935746e5299dc4de5f2516146e0411bd85f`. Whether
-the stock NCCL shipped in the base image also works is **untested**.
+`image/nccl/libnccl.so.2.30.7` is the NCCL build the launch script selects
+through `VLLM_NCCL_SO_PATH` and `LD_PRELOAD`. It self-identifies as
+`NCCL version 2.30.7 compiled with CUDA 13.0`, targets arm64, and has sha256
+`ccd57342449c3f680befcb379329b935746e5299dc4de5f2516146e0411bd85f`. Its source
+revision is unrecorded — verify licensing before redistributing this
+repository publicly. Whether the stock NCCL shipped in the base image also
+works is **untested**.
 
 The image and the checkpoint must be present at identical tags and paths on
 both nodes.
