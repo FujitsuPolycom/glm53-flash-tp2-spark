@@ -32,6 +32,19 @@ the stock NCCL shipped in the base image also works is **untested**.
 The image and the checkpoint must be present at identical tags and paths on
 both nodes.
 
+## Checkpoint
+
+`local-inference-lab/GLM-5.3-Flash-NVFP4` from Hugging Face: 55 files,
+198,117,815,694 bytes, including the four `model-mtp-*.safetensors` shards
+that hold the multi-token-prediction draft weights and the tokenizer and chat
+template files. Download to the same path on both nodes; the path is one of
+the assignments at the top of the launch script.
+
+```bash
+hf download local-inference-lab/GLM-5.3-Flash-NVFP4 \
+  --local-dir /var/tmp/models/local-inference-lab--GLM-5.3-Flash-NVFP4/staging
+```
+
 ## Patches
 
 Four files, 64 changed lines total. Without them the engine fails at load or
@@ -110,8 +123,10 @@ rank 1 first; rank 0 hosts the API on port 8000.
 ```
 
 Edit the assignments at the top of the script for image tag, checkpoint path,
-patch directory, and master address. Flags that are load-bearing rather than
-tuning choices:
+patch directory, and master address. The script's NCCL environment block is
+written for two directly-cabled nodes with the device names DGX Spark
+enumerates; the header comment in the script lists what to change for a
+switched fabric. Flags that are load-bearing rather than tuning choices:
 
 | Flag | Value | Reason |
 |---|---|---|
@@ -121,11 +136,11 @@ tuning choices:
 | `--speculative-config` | `{"method":"mtp","num_speculative_tokens":3}` | Requires the MTP fix above. |
 | `--max-model-len` | `524288` | 10 GiB of KV yields ~1.16M tokens, 2.22 concurrent requests at this length. |
 | `--max-num-seqs` | `8` | Requests beyond this queue; aggregate throughput is flat above it. |
-| `--load-format` | `instanttensor` | Optional. 184 GB in ~30 s against ~700 s sequential. Omit if the package is absent. |
-
-`instanttensor` is source-only on PyPI and compiles on arm64. Install with
-`--no-deps`; dependency resolution downgrades the image's NCCL from 2.30.7 to
-2.29.7.
+The launch script does not pass `--load-format`, so weight loading uses the
+sequential default (~700 s for the 184 GB of shards). The `instanttensor`
+loader reads the same shards in ~30 s with parallel direct I/O. To use it,
+build the variant below, point the script's `image=` assignment at its tag,
+and add `--load-format instanttensor` to the vLLM flags:
 
 ```dockerfile
 FROM glm53-nvfp4-serving:local
@@ -133,6 +148,20 @@ ENV MAX_JOBS=8
 RUN pip install --no-deps --no-build-isolation instanttensor==0.1.9 && \
     python3 -c "import instanttensor"
 ```
+
+`instanttensor` is source-only on PyPI and compiles on arm64. `--no-deps` is
+required: dependency resolution downgrades the image's NCCL package from
+2.30.7 to 2.29.7.
+
+A successful boot logs, in order: `Model loading took 92.72 GiB`, the
+`[quantprobe] ... algo=MXFP8` line from the [MTP](#mtp) section, and
+
+```
+GPU KV cache size: 1,164,369 tokens, Maximum concurrency for 524,288 tokens per request: 2.22x
+```
+
+before `Application startup complete`. The token count scales with
+`--kv-cache-memory-bytes`.
 
 ## Requests
 

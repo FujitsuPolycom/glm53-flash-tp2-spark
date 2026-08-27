@@ -14,12 +14,20 @@
 # Weights are ~177 GiB over two nodes, so ~88.5 GiB of the 121 GiB unified
 # memory per node. KV is capped explicitly rather than left to the utilization
 # fraction because the weight footprint leaves little headroom.
+# The NCCL/GLOO environment below is written for two directly-cabled nodes:
+# /30 point-to-point links, RDMA and management device names as DGX Spark
+# enumerates them. On a switched fabric, set NCCL_SOCKET_IFNAME/NCCL_IB_HCA to
+# your devices, match NCCL_IB_SUBNET_PREFIX_LEN to your subnetting, and
+# reconsider NCCL_ALGO=Ring and NCCL_SKIP_TREE_CONNECT.
 set -euo pipefail
 
 rank="${1:?node rank required (0 or 1)}"
 host_ip="${2:?host IP for this node required}"
 
-image="sparkring-glm53-official-spark:flashkda-rdma-v3-it"
+# Image built from image/Dockerfile. For the instanttensor weight loader, build
+# the variant in README "Launch config", set its tag here, and add
+# "--load-format instanttensor" to the vLLM flags below.
+image="glm53-nvfp4-serving:local"
 container="glm53-nvfp4-tp2-mtp3-r${rank}"
 model_dir="/var/tmp/models/local-inference-lab--GLM-5.3-Flash-NVFP4/staging"
 cache_dir="/var/tmp/glm53-nvfp4-tp2-jit-r${rank}"
@@ -88,7 +96,6 @@ exec docker run -d \
   /models/glm53nvfp4 \
   --served-model-name glm-5.3-flash-nvfp4-tp2-mtp3 \
   --tensor-parallel-size 2 \
-  --load-format instanttensor \
   --kv-cache-dtype fp8 \
   --block-size 256 \
   --gpu-memory-utilization 0.90 \
