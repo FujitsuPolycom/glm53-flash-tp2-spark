@@ -1,0 +1,29 @@
+--- a/vllm/renderers/base.py
++++ b/vllm/renderers/base.py
+@@ -1,6 +1,7 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import asyncio
++import os
+ import time
+ from abc import ABC, abstractmethod
+ from collections.abc import Mapping, Sequence
+@@ -258,6 +259,18 @@
+             except Exception:
+                 logger.warning("Chat template warmup failed", exc_info=True)
+ 
++            # GLM-5.3-Flash's API-side synthetic multimodal warmup creates a
++            # maximum-size dummy video at max_model_len. On unified-memory
++            # DGX Spark nodes this can add roughly 15 GiB to the rank-0 API
++            # process after the engine is already resident and trigger the
++            # host OOM killer. This skips only the synthetic startup warmup;
++            # real multimodal requests still use the normal processor path.
++            if os.getenv("SPARKRING_SKIP_MM_RENDERER_WARMUP") == "1":
++                logger.info(
++                    "Skipping API-side synthetic multi-modal renderer warmup"
++                )
++                return
++
+             if self.mm_processor:
+                 try:
+                     logger.debug("Warming up multi-modal processing...")

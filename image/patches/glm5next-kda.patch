@@ -1,0 +1,235 @@
+--- a/vllm/models/glm5next/nvidia/kda.py
++++ b/vllm/models/glm5next/nvidia/kda.py
+@@ -1,18 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+-"""GLM5-Next KDA (linear-attention) layer.
+-
+-Model-specific, self-contained KDA: separate q/k/v short-conv + the GLM5-Next
+-spec-decode verify path + the bounded ``safe_gate`` variant, and ``_forward`` is
+-an eager break point under Breakable CUDA Graph
+-(``@eager_break_during_capture``).
+-
+-Moved out of the shared ``kimi_gdn_linear_attn.py`` (which reverts to Kimi
+-Linear's fused-conv version): the separate-conv layout + spec-verify are
+-GLM5-Next-only. ``forward`` calls ``self._forward`` directly (no
+-``torch.ops.vllm.kda_attention`` indirection) so the only un-capturable work is
+-the decorated ``_forward``.
+-"""
++"""GLM-5.3-Flash KDA layer with separate convolutions and a bounded safe gate."""
+ 
+ import torch
+ from torch import nn
+@@ -53,6 +41,44 @@
+ )
+ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
+ from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
++from vllm.v1.worker.workspace import current_workspace_manager
++
++
++def _flashkda_prefill(
++    q: torch.Tensor,
++    k: torch.Tensor,
++    v: torch.Tensor,
++    g: torch.Tensor,
++    beta: torch.Tensor,
++    A_log: torch.Tensor,
++    dt_bias: torch.Tensor,
++    lower_bound: float,
++    initial_state: torch.Tensor,
++    cu_seqlens: torch.Tensor,
++    out: torch.Tensor,
++    final_state: torch.Tensor,
++    workspace: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """Run the SM12x FlashKDA prefill kernel used by Kimi K3."""
++    import vllm._flashkda_C  # noqa: F401
++
++    torch.ops._flashkda_C.fwd(
++        q.contiguous(),
++        k.contiguous(),
++        v.contiguous(),
++        g.contiguous(),
++        beta,
++        q.shape[-1] ** -0.5,
++        out,
++        workspace,
++        A_log.reshape(-1).contiguous(),
++        dt_bias.view(-1, q.shape[-1]).contiguous(),
++        lower_bound,
++        initial_state.contiguous(),
++        final_state,
++        cu_seqlens.contiguous(),
++    )
++    return out, final_state
+ 
+ 
+ class _Glm5NextMergedColumnParallelLinear(MergedColumnParallelLinear):
+@@ -165,9 +191,7 @@
+         vllm_config: VllmConfig,
+         prefix: str = "",
+     ) -> None:
+-        # GLM5-Next keeps the KDA projections BF16 even in fp8 checkpoints (no
+-        # weight_scale_inv is stored for them), so strip the quant config for
+-        # this layer's construction -- mirrors the MLA path.
++        # KDA projections remain BF16 because fp8 checkpoints omit their scales.
+         saved_quant_config = vllm_config.quant_config
+         vllm_config.quant_config = None
+         super().__init__(config, vllm_config, prefix)
+@@ -289,8 +313,7 @@
+             raise ValueError(f"Duplicate layer name: {prefix}")
+         compilation_config.static_forward_context[prefix] = self
+ 
+-        # GLM5-Next checkpoints A_log as 1-D (num_heads,); the param is 4-D, so
+-        # reshape on load before the sharded loader runs.
++        # Checkpoints store A_log as 1-D; the model parameter is 4-D.
+         def _a_log_weight_loader(param, loaded_weight):
+             if loaded_weight.dim() == 1:
+                 loaded_weight = loaded_weight.view([1, 1, -1, 1])
+@@ -298,9 +321,8 @@
+ 
+         self.A_log.weight_loader = _a_log_weight_loader
+ 
+-        # Bounded KDA gate variant: GLM5-Next uses
+-        # y = lower_bound * sigmoid(exp(A)*(g+g_bias)) instead of the default
+-        # unbounded y = -exp(A)*softplus(g+g_bias). Read by _forward.
++        # GLM-5.3-Flash uses a bounded sigmoid gate instead of the default
++        # unbounded softplus gate.
+         linear_lower_bound = getattr(config, "linear_lower_bound", None)
+         if linear_lower_bound is not None:
+             self.kda_safe_gate = True
+@@ -313,6 +335,33 @@
+             else:
+                 self.kda_safe_gate = False
+                 self.kda_lower_bound = -5.0
++
++        capability = current_platform.get_device_capability()
++        if not (
++            current_platform.is_cuda()
++            and capability is not None
++            and capability.major in (9, 10, 12)
++            and self.head_dim == 128
++            and vllm_config.model_config.dtype == torch.bfloat16
++            and self.kda_safe_gate
++        ):
++            raise RuntimeError(
++                "GLM-5.3 FlashKDA requires CUDA SM90/SM10x/SM12x, "
++                "BF16 KDA, head_dim=128, and a bounded gate"
++            )
++
++        self.kda_prefill_backend = "flashkda"
++        T = vllm_config.scheduler_config.max_num_batched_tokens
++        N = vllm_config.scheduler_config.max_num_seqs
++        H, D = self.local_num_heads, self.head_dim
++        import vllm._flashkda_C  # noqa: F401
++
++        workspace_size = torch.ops._flashkda_C.get_workspace_size(T, H, N)
++        self._flashkda_buffer_specs = (
++            ((1, T, H, D), self.model_config.dtype),
++            ((N, H, D, D), self.get_state_dtype()[1]),
++            ((workspace_size,), torch.uint8),
++        )
+         # Process-global conv-state layout, resolved once here instead of on
+         # every _forward call (it reads an env-derived flag each time).
+         self._conv_state_dim_first = is_conv_state_dim_first()
+@@ -353,13 +402,8 @@
+             dtype=hidden_states.dtype,
+             device=hidden_states.device,
+         )
+-        # Call _forward directly (not via the registered op) so the KDA core
+-        # is an eager break point under Breakable CG, mirroring KimiK3's KDA
+-        # (vllm/models/kimi_k3/nvidia/kda.py). torch.ops.vllm.kda_attention is
+-        # neither a splitting op nor @eager_break_during_capture-decorated, so
+-        # routing through it lets the host-branching prefill body be
+-        # Inductor-compiled + stream-captured under PIECEWISE -> stale garbage.
+-        # qkv stays merged through the short-conv (one conv call, not three).
++        # Call the decorated eager break directly so host-side prefill branches
++        # are not captured by PIECEWISE CUDA graphs.
+         self._forward(
+             qkv_proj_states=qkv,
+             g1=g1,
+@@ -403,11 +447,7 @@
+         num_accepted_tokens = attn_metadata_narrowed.num_accepted_tokens
+         num_spec_decodes = attn_metadata_narrowed.num_spec_decodes
+         use_spec = spec_sequence_masks is not None and num_spec_decodes > 0
+-        # KDA gate variant: GLM5-Next checkpoints with
+-        # linear_attn_config["safe_gate"]=True use the bounded gate
+-        # y=lower_bound*sigmoid(exp(A)*(g+g_bias)) instead of the default
+-        # unbounded y=-exp(A)*softplus(g+g_bias). Both attrs are always set
+-        # in __init__ (this class is GLM5Next-only).
++        # Safe-gate checkpoints use the bounded sigmoid variant.
+         safe_gate = self.kda_safe_gate
+         lower_bound = self.kda_lower_bound
+         constant_caches = self.kv_cache
+@@ -575,26 +615,51 @@
+             initial_state = gather_initial_states(
+                 recurrent_state, non_spec_state_indices_tensor, has_initial_state
+             )
+-            (
+-                core_attn_out_non_spec,
+-                last_recurrent_state,
+-            ) = chunk_kda_with_fused_gate(
+-                q=_rearr(q_ns),
+-                k=_rearr(k_ns),
+-                v=_rearr(v_ns),
+-                raw_g=g1_ns,
+-                # Chunk path wants the pre-sigmoided fp32 beta (its kernels
+-                # don't sigmoid); beta_ns is raw bf16 from forward.
+-                beta=_cast_sigmoid(beta_ns.squeeze(0)).unsqueeze(0),
+-                A_log=self.A_log,
+-                g_bias=self.dt_bias,
+-                initial_state=initial_state,
+-                output_final_state=True,
+-                use_qk_l2norm_in_kernel=True,
+-                cu_seqlens=non_spec_query_start_loc,
+-                safe_gate=safe_gate,
+-                lower_bound=lower_bound,
+-            )
++            if self.kda_prefill_backend == "flashkda":
++                workspace_out, final_state, workspace = (
++                    current_workspace_manager().get_simultaneous(
++                        *self._flashkda_buffer_specs
++                    )
++                )
++                flashkda_out = workspace_out[:, : q_ns.shape[0]]
++                (
++                    core_attn_out_non_spec,
++                    last_recurrent_state,
++                ) = _flashkda_prefill(
++                    q=_rearr(q_ns),
++                    k=_rearr(k_ns),
++                    v=_rearr(v_ns),
++                    g=g1_ns,
++                    beta=beta_ns,
++                    A_log=self.A_log,
++                    dt_bias=self.dt_bias,
++                    lower_bound=lower_bound,
++                    initial_state=initial_state,
++                    cu_seqlens=non_spec_query_start_loc,
++                    out=flashkda_out,
++                    final_state=final_state[: initial_state.shape[0]],
++                    workspace=workspace,
++                )
++            else:
++                (
++                    core_attn_out_non_spec,
++                    last_recurrent_state,
++                ) = chunk_kda_with_fused_gate(
++                    q=_rearr(q_ns),
++                    k=_rearr(k_ns),
++                    v=_rearr(v_ns),
++                    raw_g=g1_ns,
++                    # FLA wants pre-sigmoided fp32 beta; FlashKDA consumes raw.
++                    beta=_cast_sigmoid(beta_ns.squeeze(0)).unsqueeze(0),
++                    A_log=self.A_log,
++                    g_bias=self.dt_bias,
++                    initial_state=initial_state,
++                    output_final_state=True,
++                    use_qk_l2norm_in_kernel=True,
++                    cu_seqlens=non_spec_query_start_loc,
++                    safe_gate=safe_gate,
++                    lower_bound=lower_bound,
++                )
+             # Init cache
+             scatter_states(
+                 recurrent_state,

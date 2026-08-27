@@ -6,11 +6,31 @@ decoding. Weights occupy 92.72 GiB per node.
 
 ## Baseline image
 
-```
-sparkring-glm53-official-spark:flashkda-rdma-v3
+Build it from `image/`, or use an equivalent tag if one is already present on
+both nodes. The launch script names the tag in one assignment at its top.
+
+```bash
+cd image
+mkdir -p nccl && cp /path/to/your/nccl/libnccl.so* nccl/
+docker build -t glm53-nvfp4-serving:local .
 ```
 
-Required on both nodes, along with the checkpoint at an identical path.
+The base is `vllm/vllm-openai:glm53-flash`, public and pinned by digest in the
+Dockerfile. It already carries the SM120 attention overlay from
+`chriswritescode-dev/glm-5.3-flash-sm120` at commit `dc6b4fd`. On top of it the
+build applies two source patches, in `image/patches/`, totalling 184 changed
+lines: one to the multimodal renderer, one to the linear-attention prefill path
+that `--kda-prefill-backend flashkda` selects.
+
+`nccl/` must hold an NCCL 2.30.7 build for this hardware; the launch script
+selects it through `VLLM_NCCL_SO_PATH` and `LD_PRELOAD`. No NCCL binary is
+included here. The build qualified on this hardware has
+`libnccl.so.2.30.7` with sha256
+`ccd57342449c3f680befcb379329b935746e5299dc4de5f2516146e0411bd85f`. Whether
+the stock NCCL shipped in the base image also works is **untested**.
+
+The image and the checkpoint must be present at identical tags and paths on
+both nodes.
 
 ## Patches
 
@@ -26,7 +46,7 @@ mount them back over the originals; the image is unmodified.
 
 ```bash
 PATCHDIR=/var/tmp/glm53-nvfp4-patch
-IMAGE=sparkring-glm53-official-spark:flashkda-rdma-v3
+IMAGE=glm53-nvfp4-serving:local
 B=/usr/local/lib/python3.12/dist-packages/vllm
 mkdir -p "$PATCHDIR"
 
@@ -108,7 +128,7 @@ tuning choices:
 2.29.7.
 
 ```dockerfile
-FROM sparkring-glm53-official-spark:flashkda-rdma-v3
+FROM glm53-nvfp4-serving:local
 ENV MAX_JOBS=8
 RUN pip install --no-deps --no-build-isolation instanttensor==0.1.9 && \
     python3 -c "import instanttensor"
