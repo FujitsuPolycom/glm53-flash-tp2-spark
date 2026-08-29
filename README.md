@@ -1,3 +1,5 @@
+ > Repo outdated - newer, better quants exist
+
 # GLM-5.3-Flash-NVFP4 on a DGX Spark GB10 pair
 
 Serves `local-inference-lab/GLM-5.3-Flash-NVFP4` across two GB10 nodes as one
